@@ -8,7 +8,7 @@
 	branch = opentdx-guest
 [submodule "linux-l0"]
 	path = linux-l0
-	url = https://github.com/sslab-gatech/tdx-linux.git
+	url = https://github.com/cwzsquare/tdx-linux.git
 	branch = opentdx-host
 [submodule "linux-l1"]
 	path = linux-l1
@@ -20,7 +20,7 @@
 	branch = opentdx-guest
 [submodule "seabios"]
 	path = seabios
-	url = https://github.com/sslab-gatech/seabios.git
+	url = https://github.com/cwzsquare/seabios.git
 	branch = opentdx
 [submodule "seam-loader"]
 	path = seam-loader
