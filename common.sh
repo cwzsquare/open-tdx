@@ -254,6 +254,9 @@ build_seabios()
     run_cmd ./config.sh
     run_cmd make -j
 
+    objcopy -v --adjust-vma 0xf0000 out/rom16.o rom16offset.o
+    objcopy -v --adjust-vma 0x100000 out/rom.o rom32offset.o
+
     popd >/dev/null
 }
 

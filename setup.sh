@@ -19,6 +19,8 @@ echo "Setting up OpenTDX..."
 
 git submodule update --init
 
+sudo chown -R $USER:$USER .
+
 ./common.sh -t phybits
 
 ./common.sh -t qemu -l l0 -d ${distribution}

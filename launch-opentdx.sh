@@ -53,8 +53,15 @@ run_qemu()
     }
 
     qemu_str=""
-    qemu_str+="${QEMU} -cpu host -machine q35,kernel_irqchip=split -enable-kvm \\"
-    qemu_str+="-m ${mem} -smp ${smp} \\"
+    qemu_str+="${QEMU} -cpu host -enable-kvm \\"
+    qemu_str+="-m ${mem} \\"
+
+    # try prealloc=on
+    qemu_str+="-object memory-backend-ram,id=mem,size=${mem},prealloc=on \\"
+    qemu_str+="-machine q35,kernel_irqchip=split,memory-backend=mem \\"
+
+
+    qemu_str+="-smp ${smp} \\"
     qemu_str+="-bios ${SEABIOS} \\"
 
     qemu_str+="-fw_cfg opt/opentdx.npseamldr,file=${NPSEAMLDR} \\"
