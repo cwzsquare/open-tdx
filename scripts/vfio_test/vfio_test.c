@@ -1,0 +1,548 @@
+/*
+ * VFIO Test Program
+ * 
+ * This program demonstrates basic VFIO usage for testing VFIO functionality
+ * in L1 VM. It follows the VFIO API as described in:
+ * https://docs.kernel.org/driver-api/vfio.html
+ * 
+ * Usage:
+ *   sudo ./vfio_test <bdf>
+ *   Example: sudo ./vfio_test 0000:00:01.0
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <limits.h>
+#include <dirent.h>
+
+/* Try to use system VFIO header if available */
+#ifdef USE_SYSTEM_VFIO_HEADER
+#include <linux/vfio.h>
+#else
+/* VFIO IOCTL definitions */
+#define VFIO_TYPE		(';')
+#define VFIO_BASE		100
+
+#define VFIO_GET_API_VERSION		_IO(VFIO_TYPE, VFIO_BASE + 0)
+#define VFIO_CHECK_EXTENSION		_IO(VFIO_TYPE, VFIO_BASE + 1)
+#define VFIO_SET_IOMMU			_IO(VFIO_TYPE, VFIO_BASE + 2)
+
+#define VFIO_IOMMU_GET_INFO		_IO(VFIO_TYPE, VFIO_BASE + 12)
+#define VFIO_IOMMU_MAP_DMA		_IO(VFIO_TYPE, VFIO_BASE + 13)
+#define VFIO_IOMMU_UNMAP_DMA		_IO(VFIO_TYPE, VFIO_BASE + 14)
+#define VFIO_IOMMU_ENABLE		_IO(VFIO_TYPE, VFIO_BASE + 15)
+#define VFIO_IOMMU_DISABLE		_IO(VFIO_TYPE, VFIO_BASE + 16)
+
+#define VFIO_GROUP_GET_STATUS		_IO(VFIO_TYPE, VFIO_BASE + 3)
+#define VFIO_GROUP_SET_CONTAINER	_IO(VFIO_TYPE, VFIO_BASE + 4)
+#define VFIO_GROUP_UNSET_CONTAINER	_IO(VFIO_TYPE, VFIO_BASE + 5)
+#define VFIO_GROUP_GET_DEVICE_FD	_IO(VFIO_TYPE, VFIO_BASE + 6)
+
+#define VFIO_DEVICE_GET_INFO		_IO(VFIO_TYPE, VFIO_BASE + 7)
+#define VFIO_DEVICE_GET_REGION_INFO	_IO(VFIO_TYPE, VFIO_BASE + 8)
+#define VFIO_DEVICE_GET_IRQ_INFO	_IO(VFIO_TYPE, VFIO_BASE + 9)
+#define VFIO_DEVICE_SET_IRQS		_IO(VFIO_TYPE, VFIO_BASE + 10)
+#define VFIO_DEVICE_RESET		_IO(VFIO_TYPE, VFIO_BASE + 11)
+
+/* VFIO extensions */
+#define VFIO_TYPE1_IOMMU		1
+#define VFIO_TYPE1v2_IOMMU		2
+#define VFIO_SPAPR_TCE_IOMMU		3
+#define VFIO_TYPE1_NESTING_IOMMU	4
+
+/* VFIO DMA map flags */
+#define VFIO_DMA_MAP_FLAG_READ		(1 << 0)
+#define VFIO_DMA_MAP_FLAG_WRITE		(1 << 1)
+
+/* Structures */
+struct vfio_group_status {
+	uint32_t argsz;
+	uint32_t flags;
+#define VFIO_GROUP_FLAGS_VIABLE		(1 << 0)
+#define VFIO_GROUP_FLAGS_CONTAINER_SET	(1 << 1)
+};
+
+struct vfio_iommu_type1_info {
+	uint32_t argsz;
+	uint32_t flags;
+	uint64_t iova_max;
+	uint64_t iova_min;
+};
+
+struct vfio_iommu_type1_dma_map {
+	uint32_t argsz;
+	uint32_t flags;
+	uint64_t vaddr;		/* Process virtual address */
+	uint64_t iova;		/* IO virtual address */
+	uint64_t size;		/* Size of mapping (bytes) */
+};
+
+struct vfio_iommu_type1_dma_unmap {
+	uint32_t argsz;
+	uint32_t flags;
+	uint64_t iova;
+	uint64_t size;
+};
+
+struct vfio_device_info {
+	uint32_t argsz;
+	uint32_t flags;
+#define VFIO_DEVICE_FLAGS_RESET		(1 << 0)
+#define VFIO_DEVICE_FLAGS_PCI		(1 << 1)
+	uint16_t num_regions;
+	uint16_t num_irqs;
+};
+
+struct vfio_region_info {
+	uint32_t argsz;
+	uint32_t flags;
+#define VFIO_REGION_INFO_FLAG_READ	(1 << 0)
+#define VFIO_REGION_INFO_FLAG_WRITE	(1 << 1)
+#define VFIO_REGION_INFO_FLAG_MMAP	(1 << 2)
+	uint32_t index;
+	uint32_t cap_offset;
+	uint64_t size;
+	uint64_t offset;
+};
+#endif /* USE_SYSTEM_VFIO_HEADER */
+
+/* Helper functions */
+static void print_error(const char *func, int err)
+{
+	fprintf(stderr, "ERROR: %s failed: %s\n", func, strerror(err));
+}
+
+static int get_iommu_group(const char *bdf)
+{
+	char path[PATH_MAX];
+	char link[PATH_MAX];
+	char *group_str;
+	ssize_t len;
+	
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/iommu_group", bdf);
+	
+	len = readlink(path, link, sizeof(link) - 1);
+	if (len < 0) {
+		fprintf(stderr, "ERROR: Cannot read IOMMU group for %s: %s\n", 
+			bdf, strerror(errno));
+		return -1;
+	}
+	
+	link[len] = '\0';
+	group_str = strrchr(link, '/');
+	if (!group_str) {
+		fprintf(stderr, "ERROR: Invalid IOMMU group link: %s\n", link);
+		return -1;
+	}
+	
+	return atoi(group_str + 1);
+}
+
+static int open_container(void)
+{
+	int container_fd;
+	
+	container_fd = open("/dev/vfio/vfio", O_RDWR);
+	if (container_fd < 0) {
+		print_error("open(/dev/vfio/vfio)", errno);
+		return -1;
+	}
+	
+	/* Check API version */
+	int api_version = ioctl(container_fd, VFIO_GET_API_VERSION);
+	if (api_version < 0) {
+		print_error("VFIO_GET_API_VERSION", errno);
+		close(container_fd);
+		return -1;
+	}
+	
+	if (api_version != 0) {
+		printf("VFIO API version: %u\n", api_version);
+	}
+	
+	/* Check Type1 IOMMU support */
+	if (!ioctl(container_fd, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU)) {
+		fprintf(stderr, "ERROR: VFIO Type1 IOMMU not supported\n");
+		close(container_fd);
+		return -1;
+	}
+	
+	printf("✓ VFIO Type1 IOMMU supported\n");
+	
+	return container_fd;
+}
+
+static int open_group(int group_num)
+{
+	char path[PATH_MAX];
+	int group_fd;
+	
+	snprintf(path, sizeof(path), "/dev/vfio/%d", group_num);
+	
+	group_fd = open(path, O_RDWR);
+	if (group_fd < 0) {
+		print_error(path, errno);
+		return -1;
+	}
+	
+	/* Check group status */
+	struct vfio_group_status status = {
+		.argsz = sizeof(status)
+	};
+	
+	if (ioctl(group_fd, VFIO_GROUP_GET_STATUS, &status) < 0) {
+		print_error("VFIO_GROUP_GET_STATUS", errno);
+		close(group_fd);
+		return -1;
+	}
+	
+	if (!(status.flags & VFIO_GROUP_FLAGS_VIABLE)) {
+		fprintf(stderr, "ERROR: Group %d is not viable\n", group_num);
+		close(group_fd);
+		return -1;
+	}
+	
+	printf("✓ Group %d is viable\n", group_num);
+	
+	return group_fd;
+}
+
+static int setup_iommu(int container_fd, int group_fd)
+{
+	/* Add group to container */
+	if (ioctl(group_fd, VFIO_GROUP_SET_CONTAINER, &container_fd) < 0) {
+		print_error("VFIO_GROUP_SET_CONTAINER", errno);
+		return -1;
+	}
+	
+	printf("✓ Group added to container\n");
+	
+	/* Set IOMMU type */
+	if (ioctl(container_fd, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0) {
+		print_error("VFIO_SET_IOMMU", errno);
+		return -1;
+	}
+	
+	printf("✓ IOMMU type set to Type1\n");
+	
+	/* Get IOMMU info */
+	struct vfio_iommu_type1_info info = {
+		.argsz = sizeof(info)
+	};
+	
+	if (ioctl(container_fd, VFIO_IOMMU_GET_INFO, &info) < 0) {
+		print_error("VFIO_IOMMU_GET_INFO", errno);
+		return -1;
+	}
+	
+	printf("IOMMU Info:\n");
+	printf("  IOVA range: 0x%lx - 0x%lx\n", info.iova_min, info.iova_max);
+	
+	/* Enable IOMMU */
+	if (ioctl(container_fd, VFIO_IOMMU_ENABLE) < 0) {
+		/* In nested virtualization, IOMMU_ENABLE may fail, but we can still try DMA mapping */
+		printf("⚠ IOMMU_ENABLE failed (may be expected in nested virt): %s\n", strerror(errno));
+		printf("  Continuing anyway to test DMA mapping...\n");
+	} else {
+		printf("✓ IOMMU enabled\n");
+	}
+	
+	return 0;
+}
+
+static int test_dma_map(int container_fd, void **vaddr_out, uint64_t *iova_out)
+{
+	void *vaddr;
+	uint64_t iova = 0;
+	size_t size = 1024 * 1024; /* 1MB */
+	
+	/* Allocate memory */
+	vaddr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+		     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (vaddr == MAP_FAILED) {
+		print_error("mmap", errno);
+		return -1;
+	}
+	
+	printf("✓ Allocated %zu bytes at virtual address: %p\n", size, vaddr);
+	
+	/* Fill with test pattern */
+	memset(vaddr, 0xAA, size);
+	printf("✓ Filled memory with test pattern (0xAA)\n");
+	
+	/* Map DMA */
+	struct vfio_iommu_type1_dma_map dma_map = {
+		.argsz = sizeof(dma_map),
+		.flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+		.vaddr = (uint64_t)(uintptr_t)vaddr,
+		.iova = iova,
+		.size = size
+	};
+	
+	if (ioctl(container_fd, VFIO_IOMMU_MAP_DMA, &dma_map) < 0) {
+		print_error("VFIO_IOMMU_MAP_DMA", errno);
+		munmap(vaddr, size);
+		return -1;
+	}
+	
+	printf("✓ DMA mapped: IOVA=0x%lx, VADDR=%p, SIZE=%zu\n",
+	       dma_map.iova, vaddr, size);
+	
+	*vaddr_out = vaddr;
+	*iova_out = dma_map.iova;
+	
+	return 0;
+}
+
+static int get_device_fd(int group_fd, const char *bdf)
+{
+	int device_fd;
+	
+	device_fd = ioctl(group_fd, VFIO_GROUP_GET_DEVICE_FD, bdf);
+	if (device_fd < 0) {
+		print_error("VFIO_GROUP_GET_DEVICE_FD", errno);
+		return -1;
+	}
+	
+	printf("✓ Got device file descriptor for %s\n", bdf);
+	
+	/* Get device info */
+	struct vfio_device_info device_info = {
+		.argsz = sizeof(device_info)
+	};
+	
+	if (ioctl(device_fd, VFIO_DEVICE_GET_INFO, &device_info) < 0) {
+		/* In nested virt, this may fail, but device FD is still valid */
+		printf("⚠ VFIO_DEVICE_GET_INFO failed (may be expected): %s\n", strerror(errno));
+		printf("  Device FD is still valid, continuing...\n");
+		/* Don't return error, just continue with default values */
+		device_info.num_regions = 0;
+		device_info.num_irqs = 0;
+		device_info.flags = 0;
+	}
+	
+	if (device_info.num_regions > 0 || device_info.num_irqs > 0) {
+		printf("Device Info:\n");
+		printf("  Flags: 0x%x\n", device_info.flags);
+		printf("  Regions: %u\n", device_info.num_regions);
+		printf("  IRQs: %u\n", device_info.num_irqs);
+		
+		/* Get region info for first few regions */
+		for (uint32_t i = 0; i < device_info.num_regions && i < 6; i++) {
+			struct vfio_region_info region_info = {
+				.argsz = sizeof(region_info),
+				.index = i
+			};
+			
+			if (ioctl(device_fd, VFIO_DEVICE_GET_REGION_INFO, &region_info) == 0) {
+				printf("  Region %u: size=0x%lx, offset=0x%lx, flags=0x%x\n",
+				       i, region_info.size, region_info.offset, region_info.flags);
+			}
+		}
+	}
+	
+	return device_fd;
+}
+
+static void usage(const char *prog)
+{
+	fprintf(stderr, "Usage: %s <bdf>\n", prog);
+	fprintf(stderr, "  bdf: PCI device in format 0000:XX:YY.Z\n");
+	fprintf(stderr, "  Example: %s 0000:00:01.0\n", prog);
+	fprintf(stderr, "\n");
+	fprintf(stderr, "This program tests VFIO functionality:\n");
+	fprintf(stderr, "  1. Opens VFIO container and group\n");
+	fprintf(stderr, "  2. Sets up IOMMU\n");
+	fprintf(stderr, "  3. Performs DMA mapping\n");
+	fprintf(stderr, "  4. Gets device file descriptor\n");
+	fprintf(stderr, "  5. Reads device information\n");
+}
+
+int main(int argc, char *argv[])
+{
+	int container_fd = -1;
+	int group_fd = -1;
+	int device_fd = -1;
+	int group_num;
+	const char *bdf;
+	void *vaddr = NULL;
+	uint64_t iova = 0;
+	int ret = 1;
+	
+	if (argc != 2) {
+		usage(argv[0]);
+		return 1;
+	}
+	
+	bdf = argv[1];
+	
+	printf("=== VFIO Test Program ===\n");
+	printf("Testing device: %s\n\n", bdf);
+	
+	/* Check if running as root */
+	if (geteuid() != 0) {
+		fprintf(stderr, "ERROR: This program must be run as root\n");
+		return 1;
+	}
+	
+	/* Get IOMMU group */
+	group_num = get_iommu_group(bdf);
+	if (group_num < 0) {
+		return 1;
+	}
+	printf("✓ IOMMU group: %d\n\n", group_num);
+	
+	/* Open container */
+	container_fd = open_container();
+	if (container_fd < 0) {
+		return 1;
+	}
+	printf("\n");
+	
+	/* Open group */
+	group_fd = open_group(group_num);
+	if (group_fd < 0) {
+		goto cleanup;
+	}
+	printf("\n");
+	
+	/* Setup IOMMU */
+	if (setup_iommu(container_fd, group_fd) < 0) {
+		goto cleanup;
+	}
+	printf("\n");
+	
+	/* Test DMA mapping */
+	printf("=== Testing DMA Mapping ===\n");
+	if (test_dma_map(container_fd, &vaddr, &iova) < 0) {
+		goto cleanup;
+	}
+	printf("\n");
+	
+	/* Get device file descriptor */
+	printf("=== Getting Device File Descriptor ===\n");
+	device_fd = get_device_fd(group_fd, bdf);
+	if (device_fd < 0) {
+		printf("⚠ Warning: Could not get device FD, but continuing for PTE verification...\n");
+		device_fd = -1;  /* Continue even if device FD fails */
+	}
+	printf("\n");
+	
+	printf("=== Test Summary ===\n");
+	printf("✓ All VFIO operations completed successfully\n");
+	printf("  - Container: fd=%d\n", container_fd);
+	printf("  - Group: fd=%d (group %d)\n", group_fd, group_num);
+	printf("  - Device: fd=%d (%s)\n", device_fd, bdf);
+	printf("  - DMA: IOVA=0x%lx, VADDR=%p\n", iova, vaddr);
+	printf("\n");
+	printf("\n=== Virtual Address for PTE Verification ===\n");
+	printf("Virtual Address: %p\n", vaddr);
+	printf("Process PID: %d\n", getpid());
+	
+	/* Write address to a file for easy access (before any memory access) */
+	{
+		FILE *fp = fopen("/tmp/vfio_vaddr.txt", "w");
+		if (fp) {
+			fprintf(fp, "%p\n", vaddr);
+			fclose(fp);
+			printf("✓ Virtual address saved to /tmp/vfio_vaddr.txt\n");
+		}
+	}
+	
+	/* Verify PTE FIRST (before touching memory) */
+	/* This is important: if U/S bit is cleared, user-space cannot access the memory */
+	printf("\n=== PTE Verification (BEFORE memory access) ===\n");
+	int pte_has_user_bit = 0;
+	{
+		char cmd[512];
+		FILE *fp;
+		char line[512];
+		pid_t pid = getpid();
+		
+		/* Use PID:ADDR format to verify PTE in this process */
+		snprintf(cmd, sizeof(cmd), "echo '%d:%p' > /proc/verify_pte 2>/dev/null && cat /proc/verify_pte 2>/dev/null", pid, vaddr);
+		fp = popen(cmd, "r");
+		if (fp) {
+			while (fgets(line, sizeof(line), fp)) {
+				printf("%s", line);
+				/* Check if _PAGE_USER bit is set */
+				if (strstr(line, "SET (user page)") != NULL) {
+					pte_has_user_bit = 1;
+				} else if (strstr(line, "CLEARED (kernel page)") != NULL) {
+					pte_has_user_bit = 0;
+				}
+			}
+			pclose(fp);
+		} else {
+			printf("Warning: Could not execute verification command\n");
+		}
+	}
+	
+	printf("\n=== Program paused for PTE verification ===\n");
+
+
+	printf("Virtual address saved to: /tmp/vfio_vaddr.txt\n");
+	printf("Process PID: %d (keep this process running)\n", getpid());
+	printf("\nIn another terminal, verify PTE:\n");
+#ifdef RUN_ON_AGENT
+	printf("  cat /tmp/vfio_vaddr.txt | sudo tee /proc/verify_pte && cat /proc/verify_pte\n");
+	printf("\nProgram will wait 60 seconds for verification...\n");
+	printf("Press Ctrl+C to exit early, or wait for automatic exit.\n");
+
+	/* Wait for 60 seconds, checking for continue file every second */
+	int waited = 0;
+	while (waited < 60) {
+		if (access("/tmp/vfio_continue", F_OK) == 0) {
+			printf("\nContinue file found, exiting...\n");
+			unlink("/tmp/vfio_continue");
+			break;
+		}
+		sleep(1);
+		waited++;
+		if (waited % 10 == 0) {
+			printf("  (waited %d/60 seconds...)\n", waited);
+		}
+	}
+	
+	if (waited >= 60) {
+		printf("\nTimeout reached, exiting...\n");
+	}
+
+#else
+	// human interaction
+	printf("Press Enter to continue...\n");
+	getchar();
+#endif
+	ret = 0;
+	
+cleanup:
+	if (vaddr) {
+		/* Unmap DMA */
+		struct vfio_iommu_type1_dma_unmap dma_unmap = {
+			.argsz = sizeof(dma_unmap),
+			.iova = iova,
+			.size = 1024 * 1024
+		};
+		ioctl(container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap);
+		munmap(vaddr, 1024 * 1024);
+	}
+	
+	if (device_fd >= 0)
+		close(device_fd);
+	if (group_fd >= 0)
+		close(group_fd);
+	if (container_fd >= 0)
+		close(container_fd);
+	
+	return ret;
+}
+

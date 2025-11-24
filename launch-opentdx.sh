@@ -17,6 +17,7 @@ KVM_L1=kvm-l1
 LINUX_L2=linux-l2
 EDK2=edk2
 SCRIPTS=scripts
+# IMG_DIR=images
 
 run_qemu()
 {
@@ -27,22 +28,25 @@ run_qemu()
 
     nested_ssh_port=$((ssh_port + 1))
     nested_debug_port=$((debug_port + 1))
+    monitor_port=$((debug_port + 100))
 
 
-    cmdline="console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0 nohibernate debug"
+    # cmdline="console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0 nohibernate debug"
+    cmdline="console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0 nohibernate debug snd_hda_intel=0"
     gpu_str=""
 
     [ ! -z ${GPU} ] && {
-        bdfs=($(lspci | grep -i nvidia | cut -d' ' -f1))
+        bdfs=($(lspci | grep -i amd | cut -d' ' -f1))
         [ ${#bdfs[@]} -eq 0 ] && {
             echo "[-] No GPU found"
             exit 1
         }
 
-        vdids=$(lspci -nn | grep -i nvidia | sed -n 's/.*\[\(....:....\)\].*/\1/p' | paste -sd,)
+        vdids=$(lspci -nn | grep -i amd | sed -n 's/.*\[\(....:....\)\].*/\1/p' | paste -sd,)
 
+        # Enable IOMMU for vIOMMU support
         cmdline+=" intel_iommu=on iommu=on"
-        cmdline+=" vfio-pci.ids=${vdids}"
+        # cmdline+=" vfio-pci.ids=${vdids}"
 
         gpu_str="-device intel-iommu,intremap=on,caching-mode=on \\"
         gpu_str+="-device pci-bridge,id=bridge0,chassis_nr=1 \\"
@@ -53,12 +57,12 @@ run_qemu()
     }
 
     qemu_str=""
-    qemu_str+="${QEMU} -cpu host -enable-kvm \\"
+    qemu_str+="${QEMU} -cpu host -machine q35,kernel_irqchip=split -enable-kvm \\"
     qemu_str+="-m ${mem} \\"
 
-    # try prealloc=on
-    qemu_str+="-object memory-backend-ram,id=mem,size=${mem},prealloc=on \\"
-    qemu_str+="-machine q35,kernel_irqchip=split,memory-backend=mem \\"
+    # # try prealloc=on
+    # qemu_str+="-object memory-backend-ram,id=mem,size=${mem},prealloc=on \\"
+    # qemu_str+="-machine q35,kernel_irqchip=split,memory-backend=mem \\"
 
 
     qemu_str+="-smp ${smp} \\"
@@ -73,11 +77,17 @@ run_qemu()
     qemu_str+="-device virtio-net-pci,netdev=net0 \\"
     qemu_str+="-netdev user,id=net0,host=10.0.2.10,hostfwd=tcp::${ssh_port}-:22,hostfwd=tcp::${nested_ssh_port}-:10032,hostfwd=tcp::${nested_debug_port}-:1234 \\"
 
+    # qemu_str+="-serial tcp::1111,server,wait \\"
+    # qemu_str+="-serial tcp::1112,server,wait \\"
+    # qemu_str+="-monitor /dev/null \\"
+    qemu_str+="-monitor tcp:127.0.0.1:${monitor_port},server,nowait \\"
+
     qemu_str+="-virtfs local,path=${QEMU_L1},mount_tag=${QEMU_L1},security_model=passthrough,id=${QEMU_L1} \\"
     qemu_str+="-virtfs local,path=${KVM_L1},mount_tag=${KVM_L1},security_model=passthrough,id=${KVM_L1} \\"
     qemu_str+="-virtfs local,path=${LINUX_L2},mount_tag=${LINUX_L2},security_model=passthrough,id=${LINUX_L2} \\"
     qemu_str+="-virtfs local,path=${SCRIPTS},mount_tag=${SCRIPTS},security_model=passthrough,id=${SCRIPTS} \\"
     qemu_str+="-virtfs local,path=${EDK2},mount_tag=${EDK2},security_model=passthrough,id=${EDK2} \\"
+    # qemu_str+="-virtfs local,path=${IMG_DIR},mount_tag=${IMG_DIR},security_model=passthrough,id=${IMG_DIR} \\"
 
     qemu_str+=${gpu_str}
 
@@ -88,6 +98,8 @@ run_qemu()
     }
 
     qemu_str+="-nographic"
+    
+    echo ${qemu_str}
 
     eval sudo ${qemu_str}
 }
@@ -106,6 +118,7 @@ usage() {
   echo "  -d <debug_port>       Specify the debug port for l1/l2" 1>&2
   echo "                         port for l2 will be <debug_port> + 1" 1>&2
   echo "                               - default: 1234" 1>&2
+  echo "                         monitor port will be <debug_port> + 100" 1>&2
   exit 1
 }
 

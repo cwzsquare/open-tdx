@@ -115,3 +115,7 @@ Options:
   -s <smp>              Specify the SMP
                                - default: 1
 ```
+
+### Todo
+
+- simulate `MOVDIR64B` and its CPUID

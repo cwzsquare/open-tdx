@@ -24,9 +24,12 @@ sudo chown -R $USER:$USER .
 ./common.sh -t phybits
 
 ./common.sh -t qemu -l l0 -d ${distribution}
-./common.sh -t image -l l1 -d ${distribution} -s ${l1_size}
-./common.sh -t image -l l2 -d ${distribution} -s ${l2_size}
-./common.sh -t qemu -l l1 -d ${distribution}
+
+./common.sh -t image -l l1 -d ${distribution} -s ${l1_size} > l1-image.log 2>&1 &
+./common.sh -t image -l l2 -d ${distribution} -s ${l2_size} > l2-image.log 2>&1 &
+wait
+
+./common.sh -t qemu -l l1 -d ${distribution} # will change l1 image
 
 ./common.sh -t seabios
 ./common.sh -t ovmf
@@ -50,7 +53,7 @@ pushd kvm-l1 >/dev/null
 ./build.sh
 popd >/dev/null
 
-./common.sh -t vm
+./common.sh -t vm # will gen fstab on l1
 
 echo "============================================================"
 echo "= Installation is done                                     ="

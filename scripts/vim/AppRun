@@ -1,0 +1,3 @@
+#!/bin/sh -e
+export VIM="$(dirname "$(realpath "$0")")"
+exec "$VIM"/bin/vim "$@"

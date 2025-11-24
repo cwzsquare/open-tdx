@@ -227,6 +227,11 @@ finalize_vms()
     run_cmd sudo mkdir -p ${tmp}/root/images
     run_cmd sudo cp images/l2.img ${tmp}/root/images/
 
+    # Copy AMD GPU firmware files to L1 VM for amdgpu driver support
+    echo "[+] Copying AMD GPU firmware files to L1 VM..."
+    run_cmd sudo mkdir -p ${tmp}/lib/firmware/amdgpu
+    run_cmd sudo cp -r /lib/firmware/amdgpu/* ${tmp}/lib/firmware/amdgpu/ 2>/dev/null || echo "Warning: Some AMD GPU firmware files may not be available on host"
+
     fstab=""
     for dir in "qemu-l1" "kvm-l1" "linux-l2" "edk2" "scripts"
     do
@@ -305,6 +310,27 @@ build_ovmf()
     popd >/dev/null
 }
 
+build_linux_vfio_gpu_routine()
+{
+    ## vfio use
+    ./scripts/config --enable CONFIG_VFIO
+    ./scripts/config --enable CONFIG_VFIO_GROUP
+    ./scripts/config --enable CONFIG_VFIO_CONTAINER
+    ./scripts/config --enable CONFIG_VFIO_IOMMU_TYPE1
+    ./scripts/config --enable CONFIG_VFIO_VIRQFD
+    ./scripts/config --enable CONFIG_VFIO_PCI_CORE
+    ./scripts/config --enable CONFIG_VFIO_PCI_MMAP
+    ./scripts/config --enable CONFIG_VFIO_PCI_INTX
+    ./scripts/config --enable CONFIG_VFIO_PCI
+    ./scripts/config --enable CONFIG_KVM_VFIO
+
+    ./scripts/config --enable CONFIG_IOMMUFD_DRIVER
+    ./scripts/config --module CONFIG_IOMMUFD
+    ./scripts/config --enable CONFIG_VFIO_DEVICE_CDEV
+
+    ## host use amdgpu
+    # ./scripts/config --enable CONFIG_DRM_AMDGPU  
+}
 
 build_linux()
 {
@@ -381,6 +407,8 @@ build_linux()
         ./scripts/config --module CONFIG_TDX_GUEST_DRIVER
         ./scripts/config --disable CONFIG_HYPERV
 
+        # build routine
+        build_linux_vfio_gpu_routine
 
         # For debugging
         ./scripts/config --enable CONFIG_DEBUG_INFO_DWARF5
@@ -388,6 +416,107 @@ build_linux()
         ./scripts/config --disable CONFIG_RANDOMIZE_BASE
         ./scripts/config --enable CONFIG_GDB_SCRIPTS
     fi
+
+    # close 5-level page table
+    ./scripts/config --disable CONFIG_X86_5LEVEL
+
+    popd > /dev/null
+
+    run_cmd ${MAKE} olddefconfig
+
+    # TODO: Need to check configs are correctly set
+
+    echo "[+] Build linux kernel..."
+    run_cmd ${MAKE}
+}
+
+build_linux_without_clean()
+{
+    local vm_level=$1
+
+    check_argument "-l" "vm_level" ${vm_level}
+
+    NUM_CORES=$(nproc)
+    MAX_CORES=$(($NUM_CORES - 1))
+
+    run_cmd sudo apt install -y git fakeroot build-essential ncurses-dev xz-utils libssl-dev bc flex \
+                                libelf-dev bison cpio zstd
+
+    [ "$(ls -A linux-${vm_level})" ] || {
+        echo "Error: linux-${vm_level} not existing"
+        exit 1
+    }
+
+    MAKE="make -C linux-${vm_level} -j${MAX_CORES} LOCALVERSION="
+
+    # run_cmd ${MAKE} distclean
+
+    pushd linux-${vm_level} > /dev/null
+
+    if [ ${vm_level} = "l0" ];
+    then
+        [ -f /boot/config-$(uname -r) ] || {
+            echo "Error: /boot/config-$(uname -r) not found"
+            exit 1
+        }
+        run_cmd cp -f /boot/config-$(uname -r) .config
+
+        ./scripts/config --enable CONFIG_EXPERT
+        ./scripts/config --enable CONFIG_KVM_SW_PROTECTED_VM
+        ./scripts/config --enable CONFIG_KVM_GENERIC_PRIVATE_MEM
+
+        ./scripts/config --disable SYSTEM_TRUSTED_KEYS
+        ./scripts/config --disable SYSTEM_REVOCATION_KEYS
+    else # l1, l2
+        run_cmd make defconfig
+        run_cmd make kvm_guest.config
+
+        ./scripts/config --enable CONFIG_CONFIGFS_FS
+        ./scripts/config --module CONFIG_KVM
+        ./scripts/config --module CONFIG_KVM_INTEL
+
+        # For TDX host
+        ./scripts/config --enable CONFIG_EXPERT
+        ./scripts/config --enable CONFIG_KVM_SW_PROTECTED_VM
+        ./scripts/config --enable CONFIG_KVM_GENERIC_PRIVATE_MEM
+        ./scripts/config --enable CONFIG_X86_SGX_KVM
+
+        ./scripts/config --enable CONFIG_X86_X2APIC
+        ./scripts/config --enable CONFIG_CMA
+        ./scripts/config --disable CONFIG_KEXEC
+        ./scripts/config --enable CONFIG_CONTIG_ALLOC
+        ./scripts/config --enable CONFIG_ARCH_KEEP_MEMBLOCK
+        ./scripts/config --enable CONFIG_INTEL_TDX_HOST
+        ./scripts/config --enable CONFIG_KVM_INTEL_TDX
+        
+        ./scripts/config --disable CONFIG_KSM
+        ./scripts/config --disable CONFIG_EISA
+        ./scripts/config --enable CONFIG_BLK_MQ_VIRTIO
+        ./scripts/config --enable CONFIG_VIRTIO_NET
+        ./scripts/config --enable CONFIG_IRQ_REMAP
+
+        # Huge page for optimizing TD page accepting
+        ./scripts/config --enable CONFIG_TRANSPARENT_HUGEPAGE
+
+        # For TDX guest
+        ./scripts/config --enable CONFIG_SGX
+        ./scripts/config --enable CONFIG_INTEL_TDX_GUEST
+        ./scripts/config --enable CONFIG_VIRT_DRIVERS
+        ./scripts/config --module CONFIG_TDX_GUEST_DRIVER
+        ./scripts/config --disable CONFIG_HYPERV
+
+        # build routine
+        build_linux_vfio_gpu_routine
+
+        # For debugging
+        ./scripts/config --enable CONFIG_DEBUG_INFO_DWARF5
+        ./scripts/config --enable CONFIG_DEBUG_INFO
+        ./scripts/config --disable CONFIG_RANDOMIZE_BASE
+        ./scripts/config --enable CONFIG_GDB_SCRIPTS
+    fi
+
+    # close 5-level page table
+    ./scripts/config --disable CONFIG_X86_5LEVEL
 
     popd > /dev/null
 
@@ -510,6 +639,11 @@ build_initrd()
     }
 
     run_cmd sudo cp linux-${vm_level}/.config ${tmp}/boot/config-${version}
+
+    # Copy AMD GPU firmware files to initrd for early boot support
+    echo "[+] Copying AMD GPU firmware files for initrd..."
+    run_cmd sudo mkdir -p ${tmp}/lib/firmware/amdgpu
+    run_cmd sudo cp -r /lib/firmware/amdgpu/* ${tmp}/lib/firmware/amdgpu/ 2>/dev/null || echo "Warning: Some AMD GPU firmware files may not be available on host"
 
     run_chroot ${tmp} """
 echo 'nameserver 8.8.8.8' > /etc/resolv.conf
@@ -657,6 +791,9 @@ case $target in
         ;;
     "linux")
         build_linux ${vm_level}
+        ;;
+    "linux_no_clean")
+        build_linux_without_clean ${vm_level}
         ;;
     "kernel")
         install_kernel ${vm_level}

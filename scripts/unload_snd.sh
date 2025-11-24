@@ -1,0 +1,1 @@
+echo -n "0000:01:01.0" | sudo tee /sys/bus/pci/drivers/snd_hda_intel/unbind
