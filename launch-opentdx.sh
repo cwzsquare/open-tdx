@@ -30,11 +30,40 @@ run_qemu()
     nested_debug_port=$((debug_port + 1))
     monitor_port=$((debug_port + 100))
 
-
-    # cmdline="console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0 nohibernate debug"
     cmdline="console=ttyS0 root=/dev/sda rw earlyprintk=serial net.ifnames=0 nohibernate debug snd_hda_intel=0"
-    gpu_str=""
+    
+    # 初始化 QEMU 参数数组 (使用数组比 eval 拼接字符串更安全、更清晰)
+    qemu_args=()
 
+    # 基础参数
+    qemu_args+=(-cpu host -machine q35,kernel_irqchip=split -enable-kvm)
+    qemu_args+=(-m ${mem})
+    qemu_args+=(-smp ${smp})
+    qemu_args+=(-bios ${SEABIOS})
+
+    # Firmware configs
+    qemu_args+=(-fw_cfg opt/opentdx.npseamldr,file=${NPSEAMLDR})
+    qemu_args+=(-fw_cfg opt/opentdx.tdx_module,file=${TDXMODULE})
+    qemu_args+=(-fw_cfg opt/opentdx.seam_sigstruct,file=${TDXMODULE_SIGSTRUCT})
+
+    # Drive
+    qemu_args+=(-drive format=raw,file=${IMG})
+
+    # Network
+    qemu_args+=(-device virtio-net-pci,netdev=net0)
+    qemu_args+=(-netdev user,id=net0,host=10.0.2.10,hostfwd=tcp::${ssh_port}-:22,hostfwd=tcp::${nested_ssh_port}-:10032,hostfwd=tcp::${nested_debug_port}-:1234)
+
+    # Monitor
+    qemu_args+=(-monitor tcp:127.0.0.1:${monitor_port},server,nowait)
+
+    # VirtFS (Shared folders)
+    qemu_args+=(-virtfs local,path=${QEMU_L1},mount_tag=${QEMU_L1},security_model=passthrough,id=${QEMU_L1})
+    qemu_args+=(-virtfs local,path=${KVM_L1},mount_tag=${KVM_L1},security_model=passthrough,id=${KVM_L1})
+    qemu_args+=(-virtfs local,path=${LINUX_L2},mount_tag=${LINUX_L2},security_model=passthrough,id=${LINUX_L2})
+    qemu_args+=(-virtfs local,path=${SCRIPTS},mount_tag=${SCRIPTS},security_model=passthrough,id=${SCRIPTS})
+    qemu_args+=(-virtfs local,path=${EDK2},mount_tag=${EDK2},security_model=passthrough,id=${EDK2})
+
+    # GPU Passthrough Logic
     [ ! -z ${GPU} ] && {
         bdfs=($(lspci | grep -i amd | cut -d' ' -f1))
         [ ${#bdfs[@]} -eq 0 ] && {
@@ -42,66 +71,43 @@ run_qemu()
             exit 1
         }
 
-        vdids=$(lspci -nn | grep -i amd | sed -n 's/.*\[\(....:....\)\].*/\1/p' | paste -sd,)
+        # Enable Guest vIOMMU support in Kernel Commandline
+        cmdline+=" intel_iommu=on iommu=pt iommu=on"
+        
+        # Add vIOMMU device to QEMU
+        qemu_args+=(-device intel-iommu,intremap=on,caching-mode=on)
 
-        # Enable IOMMU for vIOMMU support
-        cmdline+=" intel_iommu=on iommu=on"
-        # cmdline+=" vfio-pci.ids=${vdids}"
+        # ---------------------------------------------------------------------
+        # [FIX] 解决 "group used in multiple address spaces" 问题
+        # 即使 Host 上有多个设备在同一个 Group，我们只直通第一个给 VM。
+        # 这样避免了 Guest vIOMMU 试图将同一个物理 Group 拆分到不同虚拟域的冲突。
+        # ---------------------------------------------------------------------
+        
+        # 只取数组中的第一个设备
+        target_bdf="${bdfs[0]}" 
+        echo "Detected GPU devices: ${bdfs[*]}"
+        echo "Passing through ONLY primary device: ${target_bdf} to avoid IOMMU group split conflict."
 
-        gpu_str="-device intel-iommu,intremap=on,caching-mode=on \\"
-        gpu_str+="-device pci-bridge,id=bridge0,chassis_nr=1 \\"
-        for bdf in ${bdfs[@]}
-        do
-            gpu_str+="-device vfio-pci,bus=bridge0,host=${bdf} \\"
-        done
+        # 为这一个设备创建 Root Port 并挂载
+        qemu_args+=(-device pcie-root-port,id=port0,chassis=0,slot=0,bus=pcie.0)
+        qemu_args+=(-device vfio-pci,host=${target_bdf},bus=port0)
     }
 
-    qemu_str=""
-    qemu_str+="${QEMU} -cpu host -machine q35,kernel_irqchip=split -enable-kvm \\"
-    qemu_str+="-m ${mem} \\"
-
-    # # try prealloc=on
-    # qemu_str+="-object memory-backend-ram,id=mem,size=${mem},prealloc=on \\"
-    # qemu_str+="-machine q35,kernel_irqchip=split,memory-backend=mem \\"
-
-
-    qemu_str+="-smp ${smp} \\"
-    qemu_str+="-bios ${SEABIOS} \\"
-
-    qemu_str+="-fw_cfg opt/opentdx.npseamldr,file=${NPSEAMLDR} \\"
-    qemu_str+="-fw_cfg opt/opentdx.tdx_module,file=${TDXMODULE} \\"
-    qemu_str+="-fw_cfg opt/opentdx.seam_sigstruct,file=${TDXMODULE_SIGSTRUCT} \\"
-
-    qemu_str+="-drive format=raw,file=${IMG} \\"
-
-    qemu_str+="-device virtio-net-pci,netdev=net0 \\"
-    qemu_str+="-netdev user,id=net0,host=10.0.2.10,hostfwd=tcp::${ssh_port}-:22,hostfwd=tcp::${nested_ssh_port}-:10032,hostfwd=tcp::${nested_debug_port}-:1234 \\"
-
-    # qemu_str+="-serial tcp::1111,server,wait \\"
-    # qemu_str+="-serial tcp::1112,server,wait \\"
-    # qemu_str+="-monitor /dev/null \\"
-    qemu_str+="-monitor tcp:127.0.0.1:${monitor_port},server,nowait \\"
-
-    qemu_str+="-virtfs local,path=${QEMU_L1},mount_tag=${QEMU_L1},security_model=passthrough,id=${QEMU_L1} \\"
-    qemu_str+="-virtfs local,path=${KVM_L1},mount_tag=${KVM_L1},security_model=passthrough,id=${KVM_L1} \\"
-    qemu_str+="-virtfs local,path=${LINUX_L2},mount_tag=${LINUX_L2},security_model=passthrough,id=${LINUX_L2} \\"
-    qemu_str+="-virtfs local,path=${SCRIPTS},mount_tag=${SCRIPTS},security_model=passthrough,id=${SCRIPTS} \\"
-    qemu_str+="-virtfs local,path=${EDK2},mount_tag=${EDK2},security_model=passthrough,id=${EDK2} \\"
-    # qemu_str+="-virtfs local,path=${IMG_DIR},mount_tag=${IMG_DIR},security_model=passthrough,id=${IMG_DIR} \\"
-
-    qemu_str+=${gpu_str}
-
-    qemu_str+="-kernel ${KERNEL} -initrd ${INITRD} -append \"${cmdline}\" \\"
-
+    # Debug
     [ ! -z ${DEBUG} ] && {
-        qemu_str+="-S -gdb tcp::${debug_port} \\"
+        qemu_args+=(-S -gdb tcp::${debug_port})
     }
 
-    qemu_str+="-nographic"
-    
-    echo ${qemu_str}
+    # Kernel cmdline
+    qemu_args+=(-kernel ${KERNEL} -initrd ${INITRD} -append "${cmdline}")
+    qemu_args+=(-nographic)
 
-    eval sudo ${qemu_str}
+    # Print the command (optional)
+    echo "Starting QEMU..."
+    # echo sudo ${QEMU} "${qemu_args[@]}"
+
+    # Execution
+    sudo ${QEMU} "${qemu_args[@]}"
 }
 
 # Function to show usage information

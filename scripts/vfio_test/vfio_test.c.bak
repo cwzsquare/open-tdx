@@ -175,11 +175,11 @@ static int setup_iommu(int container_fd, int group_fd)
 	return 0;
 }
 
-static int test_dma_map(int container_fd, void **vaddr_out, uint64_t *iova_out, size_t *size_out, size_t test_size)
+static int test_dma_map(int container_fd, void **vaddr_out, uint64_t *iova_out)
 {
 	void *vaddr;
 	uint64_t iova = 0;
-	size_t size = test_size;
+	size_t size = 1024 * 1024; /* 1MB */
 	
 	/* Allocate memory */
 	vaddr = mmap(NULL, size, PROT_READ | PROT_WRITE,
@@ -189,8 +189,7 @@ static int test_dma_map(int container_fd, void **vaddr_out, uint64_t *iova_out, 
 		return -1;
 	}
 	
-	printf("✓ Allocated %zu bytes (%zu pages) at virtual address: %p\n", 
-	       size, size / 4096, vaddr);
+	printf("✓ Allocated %zu bytes at virtual address: %p\n", size, vaddr);
 	
 	/* Fill with test pattern */
 	memset(vaddr, 0xAA, size);
@@ -216,70 +215,8 @@ static int test_dma_map(int container_fd, void **vaddr_out, uint64_t *iova_out, 
 	
 	*vaddr_out = vaddr;
 	*iova_out = dma_map.iova;
-	*size_out = size;
 	
 	return 0;
-}
-
-/* Verify PTE for all pages in the DMA buffer */
-static int verify_all_ptes(void *vaddr, size_t size, pid_t pid)
-{
-	const size_t page_size = 4096;
-	size_t num_pages = size / page_size;
-	void *page_addr;
-	int all_ok = 1;
-	char cmd[512];
-	FILE *fp;
-	char line[512];
-	
-	printf("\n=== Verifying PTE for all %zu pages ===\n", num_pages);
-	
-	for (size_t i = 0; i < num_pages; i++) {
-		page_addr = (char *)vaddr + (i * page_size);
-		
-		printf("  Page %zu/%zu: address %p", i + 1, num_pages, page_addr);
-		
-		/* Use PID:ADDR format to verify PTE */
-		snprintf(cmd, sizeof(cmd), 
-			"echo '%d:%p' > /proc/verify_pte 2>/dev/null && cat /proc/verify_pte 2>/dev/null",
-			pid, page_addr);
-		
-		fp = popen(cmd, "r");
-		if (fp) {
-			bool found_user_bit = false;
-			bool found_cleared = false;
-			
-			while (fgets(line, sizeof(line), fp)) {
-				/* Check if _PAGE_USER bit is cleared */
-				if (strstr(line, "CLEARED (kernel page)") != NULL) {
-					found_cleared = true;
-				} else if (strstr(line, "SET (user page)") != NULL) {
-					found_user_bit = true;
-				}
-			}
-			pclose(fp);
-			
-			if (found_cleared) {
-				printf(" ✓ (_PAGE_USER cleared)\n");
-			} else if (found_user_bit) {
-				printf(" ✗ (_PAGE_USER still set!)\n");
-				all_ok = 0;
-			} else {
-				printf(" ⚠ (status unclear)\n");
-			}
-		} else {
-			printf(" ✗ (verification failed)\n");
-			all_ok = 0;
-		}
-	}
-	
-	if (all_ok) {
-		printf("\n✓ All pages verified: _PAGE_USER bit cleared for all %zu pages\n", num_pages);
-	} else {
-		printf("\n✗ Some pages failed verification\n");
-	}
-	
-	return all_ok ? 0 : -1;
 }
 
 static int get_device_fd(int group_fd, const char *bdf)
@@ -356,9 +293,7 @@ int main(int argc, char *argv[])
 	const char *bdf;
 	void *vaddr = NULL;
 	uint64_t iova = 0;
-	size_t dma_size = 0;
 	int ret = 1;
-	size_t test_size = 1024 * 1024; /* 1MB */
 	
 	if (argc != 2) {
 		usage(argv[0]);
@@ -404,8 +339,8 @@ int main(int argc, char *argv[])
 	printf("\n");
 	
 	/* Test DMA mapping */
-	printf("=== Testing DMA Mapping with size %zu bytes ===\n", test_size);
-	if (test_dma_map(container_fd, &vaddr, &iova, &dma_size, test_size) < 0) {
+	printf("=== Testing DMA Mapping ===\n");
+	if (test_dma_map(container_fd, &vaddr, &iova) < 0) {
 		goto cleanup;
 	}
 	printf("\n");
@@ -424,30 +359,42 @@ int main(int argc, char *argv[])
 	printf("  - Container: fd=%d\n", container_fd);
 	printf("  - Group: fd=%d (group %d)\n", group_fd, group_num);
 	printf("  - Device: fd=%d (%s)\n", device_fd, bdf);
-	printf("  - DMA: IOVA=0x%llx, VADDR=%p, SIZE=%zu\n", 
-	       (unsigned long long)iova, vaddr, dma_size);
+	printf("  - DMA: IOVA=0x%llx, VADDR=%p\n", (unsigned long long)iova, vaddr);
 	printf("\n");
+	printf("\n=== Virtual Address for PTE Verification ===\n");
+	printf("Virtual Address: %p\n", vaddr);
+	printf("Process PID: %d\n", getpid());
 	
-	/* Write address and size to a file for easy access (before any memory access) */
+	/* Write address to a file for easy access (before any memory access) */
 	{
 		FILE *fp = fopen("/tmp/vfio_vaddr.txt", "w");
 		if (fp) {
-			fprintf(fp, "%p\n%zu\n", vaddr, dma_size);
+			fprintf(fp, "%p\n", vaddr);
 			fclose(fp);
-			printf("✓ Virtual address and size saved to /tmp/vfio_vaddr.txt\n");
+			printf("✓ Virtual address saved to /tmp/vfio_vaddr.txt\n");
 		}
 	}
 	
-	/* Verify PTE for ALL pages in the DMA buffer (before touching memory) */
+	/* Verify PTE FIRST (before touching memory) */
 	/* This is important: if U/S bit is cleared, user-space cannot access the memory */
-	pid_t pid = getpid();
-	printf("\n=== PTE Verification for all pages (BEFORE memory access) ===\n");
-	printf("Virtual Address: %p\n", vaddr);
-	printf("Buffer Size: %zu bytes (%zu pages)\n", dma_size, dma_size / 4096);
-	printf("Process PID: %d\n", pid);
-	
-	if (verify_all_ptes(vaddr, dma_size, pid) < 0) {
-		printf("⚠ Warning: Some pages failed PTE verification\n");
+	printf("\n=== PTE Verification (BEFORE memory access) ===\n");
+	{
+		char cmd[512];
+		FILE *fp;
+		char line[512];
+		pid_t pid = getpid();
+		
+		/* Use PID:ADDR format to verify PTE in this process */
+		snprintf(cmd, sizeof(cmd), "echo '%d:%p' > /proc/verify_pte 2>/dev/null && cat /proc/verify_pte 2>/dev/null", pid, vaddr);
+		fp = popen(cmd, "r");
+		if (fp) {
+			while (fgets(line, sizeof(line), fp)) {
+				printf("%s", line);
+			}
+			pclose(fp);
+		} else {
+			printf("Warning: Could not execute verification command\n");
+		}
 	}
 	
 	printf("\n=== Program paused for PTE verification ===\n");
@@ -488,15 +435,15 @@ int main(int argc, char *argv[])
 	ret = 0;
 	
 cleanup:
-	if (vaddr && dma_size > 0) {
+	if (vaddr) {
 		/* Unmap DMA */
 		struct vfio_iommu_type1_dma_unmap dma_unmap = {
 			.argsz = sizeof(dma_unmap),
 			.iova = iova,
-			.size = dma_size
+			.size = 1024 * 1024
 		};
 		ioctl(container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap);
-		munmap(vaddr, dma_size);
+		munmap(vaddr, 1024 * 1024);
 	}
 	
 	if (device_fd >= 0)
